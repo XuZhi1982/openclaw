@@ -43,6 +43,7 @@ import {
 } from "./openclaw-agent-db-schema-helpers.js";
 import { inspectAgentDatabaseSchemaInWorker } from "./openclaw-agent-schema-inspection-worker.js";
 import type { AgentSchemaInspection } from "./openclaw-agent-schema-inspection.js";
+import { preflightAgentDatabasesBounded } from "./openclaw-database-preflight-agent-scheduler.js";
 import {
   describeDeferredStateSchemaPublication,
   formatIndeterminateDatabaseReadiness,
@@ -547,32 +548,26 @@ export async function preflightOpenClawDatabaseSchemas(options: {
       path: candidatePath,
     })),
   ];
-  const inspectedAgentPaths = new Set<string>();
-  const inspectedAgentTargets = new Set<string>();
-  for (const row of inspectionTargets) {
+  await preflightAgentDatabasesBounded(
+    inspectionTargets,
+    async (row, inspection, claimAgentTarget) => {
     const agentPath = row.path;
     const presence = inspectCandidatePresence(agentPath);
     if (presence.status === "absent") {
-      continue;
+        return;
     }
     if (presence.status === "indeterminate") {
-      result.indeterminate.push({ kind: "agent", path: agentPath, reason: presence.reason });
-      continue;
+        inspection.indeterminate.push({ kind: "agent", path: agentPath, reason: presence.reason });
+        return;
     }
     let agentDatabase: DatabaseSync | undefined;
     let agentSnapshot: Awaited<ReturnType<typeof prepareSqliteReadOnlyLocation>> | undefined;
     try {
       // Preserve SQLite's filesystem traversal through symlink/.. locators.
       const realAgentPath = realpathSync.native(agentPath);
-      const inspectionKey = `${realAgentPath}\0${row.agentId ?? ""}`;
-      if (
-        inspectedAgentTargets.has(inspectionKey) ||
-        (row.agentId === undefined && inspectedAgentPaths.has(realAgentPath))
-      ) {
-        continue;
+        if (!claimAgentTarget(realAgentPath, row.agentId)) {
+          return;
       }
-      inspectedAgentPaths.add(realAgentPath);
-      inspectedAgentTargets.add(inspectionKey);
       let agentVersion: number;
       let schemaInspection: AgentSchemaInspection | null = null;
       let writerAppVersion: string | undefined;
@@ -584,7 +579,9 @@ export async function preflightOpenClawDatabaseSchemas(options: {
       if (!options.requireStartupMigrationReadiness && !options.verifyCurrentSchemaShape) {
         const header = await inspectSqliteSchemaHeader(realAgentPath, {
           signal: options.signal,
-          ...(inspectOwnership ? { agentSchemaVersionForOwnership: supportedVersions.agent } : {}),
+            ...(inspectOwnership
+              ? { agentSchemaVersionForOwnership: supportedVersions.agent }
+              : {}),
         });
         options.signal?.throwIfAborted();
         agentVersion = header.userVersion;
@@ -634,12 +631,12 @@ export async function preflightOpenClawDatabaseSchemas(options: {
           metadata: agentSchemaMeta ?? null,
         });
         if (refusal) {
-          (result.agentRefusals ??= []).push(refusal);
-          continue;
+            (inspection.agentRefusals ??= []).push(refusal);
+            return;
         }
       }
       if (agentVersion < supportedVersions.agent) {
-        (result.pendingMigrations ??= []).push({
+          (inspection.pendingMigrations ??= []).push({
           kind: "agent",
           path: agentPath,
           ...(row.agentId !== undefined ? { agentId: row.agentId } : {}),
@@ -654,7 +651,7 @@ export async function preflightOpenClawDatabaseSchemas(options: {
         throw new Error(schemaInspection.reason);
       }
       if (agentVersion > supportedVersions.agent) {
-        result.incompatible.push({
+          inspection.incompatible.push({
           kind: "agent",
           path: agentPath,
           ...(row.agentId !== undefined ? { agentId: row.agentId } : {}),
@@ -694,7 +691,7 @@ export async function preflightOpenClawDatabaseSchemas(options: {
       if (options.signal?.aborted || options.requireStartupMigrationReadiness) {
         throw error;
       }
-      result.indeterminate.push({
+        inspection.indeterminate.push({
         kind: "agent",
         path: agentPath,
         reason: formatErrorMessage(error),
@@ -706,6 +703,9 @@ export async function preflightOpenClawDatabaseSchemas(options: {
         await agentSnapshot?.cleanupAsync();
       }
     }
-  }
+    },
+    result,
+    options.signal,
+  );
   return result;
 }
